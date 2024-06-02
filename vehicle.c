@@ -5,12 +5,10 @@
 #include "projects/crossroads/map.h"
 #include "projects/crossroads/ats.h"
 
-/* Barrier to synchronize all vehicles */
-static struct condition step_cond;
 static struct lock step_lock;
-static int vehicles_ready;
-static int total_vehicles; 
-static int active_vehicles; // currently active vehicles (decresed from total vehicles if some of them reaches destination)
+static struct condition step_cond;     // Condition variable for synchronizing steps
+static int vehicles_moved_count;       // Counter for vehicles that have moved in the current step
+static int total_vehicles;             // Total number of vehicles
 
 /* path. A:0 B:1 C:2 D:3 */
 const struct position vehicle_path[4][4][12] = {
@@ -61,8 +59,10 @@ static int is_position_outside(struct position pos)
     return (pos.row == -1 || pos.col == -1);
 }
 
+
 /* return 0:termination, 1:success, -1:fail */
-static int try_move(int start, int dest, int step, struct vehicle_info *vi) {
+static int try_move(int start, int dest, int step, struct vehicle_info *vi)
+{
     struct position pos_cur, pos_next;
 
     pos_next = vehicle_path[start][dest][step];
@@ -73,33 +73,38 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi) {
         if (is_position_outside(pos_next)) {
             /* actual move */
             vi->position.row = vi->position.col = -1;
+    vi->state = VEHICLE_STATUS_FINISHED;
             /* release previous */
-            lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+    		if (!is_position_outside(pos_cur)) {
+        		lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+    		}
             return 0;
         }
     }
 
-    /* lock next position */
-    lock_acquire(&vi->map_locks[pos_next.row][pos_next.col]);
-    if (vi->state == VEHICLE_STATUS_READY) {
-        /* start this vehicle */
-        vi->state = VEHICLE_STATUS_RUNNING;
-    } else {
-        /* release current position */
-        lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
-    }
-    /* update position */
-    vi->position = pos_next;
+    /* Try to acquire the next position lock */
+    if (lock_try_acquire(&vi->map_locks[pos_next.row][pos_next.col])) {
+        if (vi->state == VEHICLE_STATUS_READY) {
+            /* start this vehicle */
+            vi->state = VEHICLE_STATUS_RUNNING;
+        } else {
+            /* release current position */
+            lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+        }
+        /* update position */
+        vi->position = pos_next;
 
-    return 1;
+        return 1;
+    }
+    return -1;
 }
 
+
 void init_on_mainthread(int thread_cnt) {
-    cond_init(&step_cond);
     lock_init(&step_lock);
-    vehicles_ready = 0;
+    cond_init(&step_cond);
+    vehicles_moved_count = 0;
     total_vehicles = thread_cnt;
-	active_vehicles = total_vehicles;
 }
 
 void vehicle_loop(void *_vi) {
@@ -120,34 +125,33 @@ void vehicle_loop(void *_vi) {
         res = try_move(start, dest, step, vi);
         if (res == 1) {
             step++;
+        } else if (res == -1) {
+            /* If move failed due to lock, proceed to next step */
+            res = 0;  // Treat as step finished for synchronization purposes
         }
 
-        /* termination condition. */
-        if (res == 0) {
-            lock_acquire(&step_lock);
-            active_vehicles--; // decrease number of active vehicles if they arrive at destination
-            vehicles_ready--;  // Ensure vehicles_ready is correct if a vehicle finishes
-            if (active_vehicles == 0) {
-                cond_broadcast(&step_cond, &step_lock); // Wake up all waiting threads if no active vehicles left
-            }
-            lock_release(&step_lock);
-            break;
-        }
-
-        /* synchronization step */
+        /* Synchronize step */
         lock_acquire(&step_lock);
-        vehicles_ready++;
-        if (vehicles_ready == active_vehicles) {
-            vehicles_ready = 0;
+        vehicles_moved_count++;
+        if (vehicles_moved_count == total_vehicles) {
+            /* All vehicles have attempted to move, increment step and notify all */
             crossroads_step++;
             unitstep_changed();
+            vehicles_moved_count = 0;  // Reset for the next step
             cond_broadcast(&step_cond, &step_lock);
         } else {
-		cond_wait(&step_cond, &step_lock);
+            /* Wait until all vehicles have attempted to move */
+            cond_wait(&step_cond, &step_lock);
         }
         lock_release(&step_lock);
+
+        /* termination condition */
+        if (res == 0 && vi->state == VEHICLE_STATUS_FINISHED) {
+            break;
+        }
     }
 
     /* status transition must happen before sema_up */
+	total_vehicles--;
     vi->state = VEHICLE_STATUS_FINISHED;
 }
