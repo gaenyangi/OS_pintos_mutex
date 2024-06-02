@@ -125,9 +125,6 @@ void vehicle_loop(void *_vi) {
         res = try_move(start, dest, step, vi);
         if (res == 1) {
             step++;
-        } else if (res == -1) {
-            /* If move failed due to lock, proceed to next step */
-            res = 0;  // Treat as step finished for synchronization purposes
         }
 
         /* Synchronize step */
@@ -143,15 +140,25 @@ void vehicle_loop(void *_vi) {
             /* Wait until all vehicles have attempted to move */
             cond_wait(&step_cond, &step_lock);
         }
+
+        /* Check termination condition */
+        if (res == 0) {
+            total_vehicles--;  // Decrement the total vehicle count when a vehicle finishes
+		if (total_vehicles==0) {
+                cond_broadcast(&step_cond,&step_lock);  // Wake up any remaining waiting threads
+                lock_release(&step_lock);
+                break;
+            }
+        }
+
         lock_release(&step_lock);
 
-        /* termination condition */
-        if (res == 0 && vi->state == VEHICLE_STATUS_FINISHED) {
+	if (res == 0) {
             break;
         }
     }
 
     /* status transition must happen before sema_up */
-	total_vehicles--;
     vi->state = VEHICLE_STATUS_FINISHED;
 }
+
