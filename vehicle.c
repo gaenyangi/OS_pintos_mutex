@@ -10,6 +10,10 @@ static struct condition step_cond;     // Condition variable for synchronizing s
 static int vehicles_moved_count;       // Counter for vehicles that have moved in the current step
 static int total_vehicles;             // Total number of vehicles
 
+static struct lock critical_area_lock; // prevent for enter more than 8 cars in crossroads.
+static int cars_in_critical_area;
+
+
 /* path. A:0 B:1 C:2 D:3 */
 const struct position vehicle_path[4][4][12] = {
     /* from A */ {
@@ -73,11 +77,19 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
         if (is_position_outside(pos_next)) {
             /* actual move */
             vi->position.row = vi->position.col = -1;
-    vi->state = VEHICLE_STATUS_FINISHED;
+            vi->state = VEHICLE_STATUS_FINISHED;
             /* release previous */
-    		if (!is_position_outside(pos_cur)) {
-        		lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
-    		}
+            if (!is_position_outside(pos_cur)) {
+                if (lock_held_by_current_thread(&vi->map_locks[pos_cur.row][pos_cur.col])) {
+                    lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+                }
+            }
+            if (vi->in_critical_area) {
+                lock_acquire(&critical_area_lock);
+                cars_in_critical_area--;
+                lock_release(&critical_area_lock);
+                vi->in_critical_area = false;
+            }
             return 0;
         }
     }
@@ -89,7 +101,29 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
             vi->state = VEHICLE_STATUS_RUNNING;
         } else {
             /* release current position */
-            lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+            if (!is_position_outside(pos_cur)) {
+                if (lock_held_by_current_thread(&vi->map_locks[pos_cur.row][pos_cur.col])) {
+                    lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
+                }
+                if (vi->in_critical_area) {
+                    lock_acquire(&critical_area_lock);
+                    cars_in_critical_area--;
+                    lock_release(&critical_area_lock);
+                    vi->in_critical_area = false;
+                }
+            }
+        }
+        if ((pos_next.row >= 2 && pos_next.row <= 4) && (pos_next.col >= 2 && pos_next.col <= 4) && !(pos_next.row == 3 && pos_next.col == 3)) {
+            lock_acquire(&critical_area_lock);
+            if (cars_in_critical_area >= 4) {
+                lock_release(&critical_area_lock);
+                /* If more than 8 cars, release lock and return fail */
+                lock_release(&vi->map_locks[pos_next.row][pos_next.col]);
+                return -1;
+            }
+            cars_in_critical_area++;
+            vi->in_critical_area = true; // Update the flag
+            lock_release(&critical_area_lock);
         }
         /* update position */
         vi->position = pos_next;
@@ -99,12 +133,13 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
     return -1;
 }
 
-
 void init_on_mainthread(int thread_cnt) {
     lock_init(&step_lock);
     cond_init(&step_cond);
     vehicles_moved_count = 0;
     total_vehicles = thread_cnt;
+    lock_init(&critical_area_lock);
+    cars_in_critical_area = 0;
 }
 
 void vehicle_loop(void *_vi) {
@@ -118,6 +153,7 @@ void vehicle_loop(void *_vi) {
 
     vi->position.row = vi->position.col = -1;
     vi->state = VEHICLE_STATUS_READY;
+    vi->in_critical_area = false; // Initialize the flag
 
     step = 0;
     while (1) {
@@ -127,7 +163,6 @@ void vehicle_loop(void *_vi) {
             step++;
         }
 
-        /* Synchronize step */
         lock_acquire(&step_lock);
         vehicles_moved_count++;
         if (vehicles_moved_count == total_vehicles) {
@@ -144,8 +179,8 @@ void vehicle_loop(void *_vi) {
         /* Check termination condition */
         if (res == 0) {
             total_vehicles--;  // Decrement the total vehicle count when a vehicle finishes
-		if (total_vehicles==0) {
-                cond_broadcast(&step_cond,&step_lock);  // Wake up any remaining waiting threads
+            if (total_vehicles == 0) {
+                cond_broadcast(&step_cond, &step_lock);  // Wake up any remaining waiting threads
                 lock_release(&step_lock);
                 break;
             }
@@ -153,7 +188,7 @@ void vehicle_loop(void *_vi) {
 
         lock_release(&step_lock);
 
-	if (res == 0) {
+        if (res == 0) {
             break;
         }
     }
