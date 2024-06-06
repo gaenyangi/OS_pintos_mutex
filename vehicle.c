@@ -5,13 +5,13 @@
 #include "projects/crossroads/map.h"
 #include "projects/crossroads/ats.h"
 
-static struct lock step_lock;
-static struct condition step_cond;     // Condition variable for synchronizing steps
-static int vehicles_moved_count;       // Counter for vehicles that have moved in the current step
-static int total_vehicles;             // Total number of vehicles
+static struct lock step_lock; // mutex lock for unit_step
+static struct condition step_cond; // Condition variable for synchronizing steps
+static int vehicles_moved_count; // number of cars that have moved in the current step
+static int total_vehicles;  // Total number of vehicles
 
-static struct lock critical_area_lock; // prevent for enter more than 8 cars in crossroads.
-static int cars_in_critical_area;
+static struct lock critical_area_lock; // mutext lock to prevent more than 4 cars enter simultaneously in crossroads.
+static int cars_in_critical_area; // number of cars in crossroad([2][2]~[4][4])
 
 
 /* path. A:0 B:1 C:2 D:3 */
@@ -77,19 +77,8 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
         if (is_position_outside(pos_next)) {
             /* actual move */
             vi->position.row = vi->position.col = -1;
-            vi->state = VEHICLE_STATUS_FINISHED;
             /* release previous */
-            if (!is_position_outside(pos_cur)) {
-                if (lock_held_by_current_thread(&vi->map_locks[pos_cur.row][pos_cur.col])) {
-                    lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
-                }
-            }
-            if (vi->in_critical_area) {
-                lock_acquire(&critical_area_lock);
-                cars_in_critical_area--;
-                lock_release(&critical_area_lock);
-                vi->in_critical_area = false;
-            }
+		lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
             return 0;
         }
     }
@@ -105,6 +94,7 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
                 if (lock_held_by_current_thread(&vi->map_locks[pos_cur.row][pos_cur.col])) {
                     lock_release(&vi->map_locks[pos_cur.row][pos_cur.col]);
                 }
+		//if the car was in crossroad(aka. critical area), signal critical area semaphore.
                 if (vi->in_critical_area) {
                     lock_acquire(&critical_area_lock);
                     cars_in_critical_area--;
@@ -115,10 +105,13 @@ static int try_move(int start, int dest, int step, struct vehicle_info *vi)
         }
         if ((pos_next.row >= 2 && pos_next.row <= 4) && (pos_next.col >= 2 && pos_next.col <= 4) && !(pos_next.row == 3 && pos_next.col == 3)) {
             lock_acquire(&critical_area_lock);
+		// check counting semaphore for critical area
             if (cars_in_critical_area >= 4) {
                 lock_release(&critical_area_lock);
-                /* If more than 8 cars, release lock and return fail */
+                // If more than 4 cars, release lock and return fail
                 lock_release(&vi->map_locks[pos_next.row][pos_next.col]);
+		// if fail to lock next_pos, remain current lock 
+		lock_try_acquire(&vi->map_locks[pos_cur.row][pos_cur.col]); 
                 return -1;
             }
             cars_in_critical_area++;
@@ -158,39 +151,43 @@ void vehicle_loop(void *_vi) {
     step = 0;
     while (1) {
         /* vehicle main code */
+
         res = try_move(start, dest, step, vi);
         if (res == 1) {
             step++;
         }
 
+	//get lock for unit step
         lock_acquire(&step_lock);
-        vehicles_moved_count++;
+	//printf("total_vehicles: %d, vehicles_moved_count: %d\n", total_vehicles, vehicles_moved_count);
+        if (res == 0) {
+            total_vehicles--;  // Decrement the total vehicle count when a vehicle finishes
+        } else {
+            vehicles_moved_count++;
+        }
+
         if (vehicles_moved_count == total_vehicles) {
-            /* All vehicles have attempted to move, increment step and notify all */
+            //if all possible move is made, increase step() and release the locked threads by cond_broadcast
             crossroads_step++;
             unitstep_changed();
             vehicles_moved_count = 0;  // Reset for the next step
-            cond_broadcast(&step_cond, &step_lock);
+            cond_broadcast(&step_cond, &step_lock); // signal() to all the waiting threads
         } else {
-            /* Wait until all vehicles have attempted to move */
-            cond_wait(&step_cond, &step_lock);
+            // Wait until all vehicles try to move
+		cond_wait(&step_cond, &step_lock);
         }
 
-        /* Check termination condition */
+	/* Check termination condition 
         if (res == 0) {
             total_vehicles--;  // Decrement the total vehicle count when a vehicle finishes
-            if (total_vehicles == 0) {
-                cond_broadcast(&step_cond, &step_lock);  // Wake up any remaining waiting threads
-                lock_release(&step_lock);
-                break;
-            }
-        }
+        }*/
 
         lock_release(&step_lock);
 
         if (res == 0) {
             break;
         }
+	
     }
 
     /* status transition must happen before sema_up */
