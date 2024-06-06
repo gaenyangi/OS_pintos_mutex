@@ -1,0 +1,20 @@
+make at /pintos/threads directory
+run at /pintos/threads/build directory with commands 
+
+../../utils/pintos crossroads aAA:bBD:cCD:dDB // given example from description, not working
+../../utils/pintos crossroads aAA:bBB:cCC:dDD // fine, no deadlock occurs by nature
+../../utils/pintos crossroads aAC:bCB // fine
+../../utils/pintos crossroads aAC:bCC // fine
+../../utils/pintos crossroads aAA:bCA // not working
+../../utils/pintos crossroads aAA:bCD // later ends first = not working
+../../utils/pintos crossroads aCD:bAA // prior ends first = fine
+../../utils/pintos crossroads aAA:bAA:cAA:dCD:eCC:fAB // not working(does not end)
+../../utils/pintos crossroads aAA:bBB:cCC:dDD:eAA:fBB:gCC:hDD:iAC:jBD:kCC:LDA // now fine
+../../utils/pintos crossroads aAA:bBB:cCC:dDD:eAA:fBB:gCC:hDD // fine, not fine after 4 enters
+../../utils/pintos crossroads aAA:bBA:cCD:dCA:eDA:fBB // fine
+../../utils/pintos crossroads aAA:bCC:cBD:dCA:eDA:fAB // not working
+
+../../utils/pintos crossroads aAA:aAA:aAA:aAA:aAA:aAA:aAA // not working, last 2 remains
+../../utils/pintos crossroads aAC:bDB:cCC:dAD:eCA:fBB:gDC:hCD:iAB:jBD:kBAC:LDA // chaotic, not working
+
+2024.06.06 fixed, all examples are working fine now.
